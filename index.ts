@@ -5,6 +5,7 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+// Prioritize environment variable, fallback to local image for dev
 const BACKEND_IMAGE = process.env.BACKEND_IMAGE || 'rn-playground-backend:latest';
 
 app.use(cors());
