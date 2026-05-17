@@ -7,6 +7,18 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 // Prioritize environment variable, fallback to local image for dev
 const BACKEND_IMAGE = process.env.BACKEND_IMAGE || 'rn-playground-backend:latest';
+const PORT_RANGE_START = 50000;
+const PORT_RANGE_END = 50100;
+
+// Simple port tracker
+let nextPort = PORT_RANGE_START;
+
+function getNextPort() {
+    const port = nextPort;
+    nextPort++;
+    if (nextPort > PORT_RANGE_END) nextPort = PORT_RANGE_START;
+    return port;
+}
 
 app.use(cors());
 app.use(express.json());
@@ -59,16 +71,14 @@ app.post('/workspaces', async (req, res) => {
         } catch (e: any) {
             if (e.statusCode === 404) {
                 console.log(`Creating new container ${containerName}`);
-                // Find an available port on the host
-                // For simplicity in this local version, we'll try to use a range
-                // In a real system, we'd use a port manager.
+                const assignedPort = getNextPort();
                 
                 container = await docker.createContainer({
                     Image: BACKEND_IMAGE,
                     name: containerName,
                     ExposedPorts: { '3000/tcp': {} },
                     HostConfig: {
-                        PortBindings: { '3000/tcp': [{ HostPort: '0' }] }, // '0' lets Docker pick a free random port
+                        PortBindings: { '3000/tcp': [{ HostPort: assignedPort.toString() }] },
                         Binds: [`${volumeName}:/workspace`],
                     },
                     Env: [`WORKSPACE_DIR=/workspace`]
@@ -85,10 +95,12 @@ app.post('/workspaces', async (req, res) => {
 
         if (!hostPort) throw new Error('Failed to retrieve host port');
 
+        const publicIp = process.env.PUBLIC_IP || 'localhost';
+
         res.json({
             status: 'ready',
-            // Since we are using HostPort mapping, we connect to localhost:mappedPort
-            url: `ws://localhost:${hostPort}`
+            // Return the public AWS IP so the browser can connect
+            url: `ws://${publicIp}:${hostPort}`
         });
 
     } catch (err: any) {
@@ -103,4 +115,20 @@ app.post('/workspaces', async (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`🚀 Docker Orchestrator ready on port ${PORT}`);
+    
+    // Cleanup interval: Remove exited containers every 5 minutes
+    setInterval(async () => {
+        try {
+            const containers = await docker.listContainers({ all: true, filters: { status: ['exited'] } });
+            for (const containerInfo of containers) {
+                if (containerInfo.Names.some(name => name.includes('workspace-con-'))) {
+                    const container = docker.getContainer(containerInfo.Id);
+                    await container.remove();
+                    console.log(`Cleaned up exited container: ${containerInfo.Names[0]}`);
+                }
+            }
+        } catch (e) {
+            console.error('Cleanup error:', e);
+        }
+    }, 5 * 60 * 1000);
 });
