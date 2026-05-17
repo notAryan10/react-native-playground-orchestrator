@@ -1,0 +1,32 @@
+{
+  "name": "orchestrator",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "dev": "tsx index.ts",
+    "start": "tsx index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/http-proxy-middleware": "^0.19.3",
+    "cors": "^2.8.6",
+    "dockerode": "^5.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "http-proxy-middleware": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/dockerode": "^4.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.8.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.22.1",
+    "typescript": "^6.0.3"
+  }
+}
