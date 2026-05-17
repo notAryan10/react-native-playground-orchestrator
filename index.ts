@@ -113,8 +113,8 @@ app.post('/workspaces', async (req, res) => {
 // but we'll keep the endpoint structure for frontend compatibility if needed.
 // Actually, let's simplify and have the frontend connect directly to the returned port.
 
-app.listen(PORT, () => {
-    console.log(`🚀 Docker Orchestrator ready on port ${PORT}`);
+app.listen(Number(PORT), '0.0.0.0', () => {
+    console.log(`🚀 Docker Orchestrator ready on port ${PORT} at 0.0.0.0`);
     
     // Cleanup interval: Remove exited containers every 5 minutes
     setInterval(async () => {
