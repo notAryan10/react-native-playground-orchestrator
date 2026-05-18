@@ -132,14 +132,24 @@ const server = app.listen(Number(PORT), '0.0.0.0', () => {
 
 // Handle WebSocket upgrades manually for the dynamic proxy
 server.on('upgrade', (req, socket, head) => {
-    const rawUrl = req.url || '';
+    const rawUrl = req.url;
+    if (!rawUrl) {
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        return;
+    }
+
     console.log(`[Upgrade] Incoming upgrade request for: ${rawUrl}`);
     
     // Simple path parsing
     const pathname = rawUrl.split('?')[0];
+    if (!pathname) {
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        return;
+    }
+
     const match = pathname.match(/^\/proxy\/([^/]+)/);
 
-    if (match) {
+    if (match && match[1]) {
         const userId = match[1];
         const targetPort = userPortMap.get(userId);
 
