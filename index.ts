@@ -14,6 +14,10 @@ const PORT_RANGE_END = 50100;
 app.use(cors());
 app.use(express.json());
 
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', message: 'Orchestrator is running' });
+});
+
 const docker = new Docker();
 
 // Keep track of which user is on which port for the proxy
@@ -100,7 +104,6 @@ app.use('/proxy/:userId', (req, res, next) => {
     return createProxyMiddleware({
         target: `http://localhost:${targetPort}`,
         changeOrigin: true,
-        ws: true,
         pathRewrite: {
             [`^/proxy/${userId}`]: '',
         },
@@ -110,7 +113,7 @@ app.use('/proxy/:userId', (req, res, next) => {
     })(req, res, next);
 });
 
-app.listen(Number(PORT), '0.0.0.0', () => {
+const server = app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`🚀 Secure Orchestrator ready on port ${PORT}`);
     
     // Cleanup interval
@@ -125,4 +128,49 @@ app.listen(Number(PORT), '0.0.0.0', () => {
             }
         } catch (e) {}
     }, 5 * 60 * 1000);
+});
+
+// Handle WebSocket upgrades manually for the dynamic proxy
+server.on('upgrade', (req, socket, head) => {
+    const rawUrl = req.url || '';
+    console.log(`[Upgrade] Incoming upgrade request for: ${rawUrl}`);
+    
+    // Simple path parsing
+    const pathname = rawUrl.split('?')[0];
+    const match = pathname.match(/^\/proxy\/([^/]+)/);
+
+    if (match) {
+        const userId = match[1];
+        const targetPort = userPortMap.get(userId);
+
+        if (targetPort) {
+            console.log(`[Upgrade] Success: Routing ${userId} to localhost:${targetPort}`);
+            const proxy = createProxyMiddleware({
+                target: `http://localhost:${targetPort}`,
+                changeOrigin: true,
+                ws: true,
+                pathRewrite: {
+                    [`^/proxy/${userId}`]: '',
+                },
+                on: {
+                    error: (err) => console.error(`[Upgrade] Proxy error for ${userId}:`, err)
+                }
+            });
+            
+            // @ts-ignore
+            if (typeof proxy.upgrade === 'function') {
+                // @ts-ignore
+                proxy.upgrade(req, socket, head);
+            } else {
+                console.error('[Upgrade] Error: Proxy upgrade method not found');
+                socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+            }
+        } else {
+            console.warn(`[Upgrade] Failed: No port found in map for user ${userId}. Map size: ${userPortMap.size}`);
+            socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+        }
+    } else {
+        console.warn(`[Upgrade] Failed: URL ${rawUrl} did not match /proxy/:userId pattern`);
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    }
 });
