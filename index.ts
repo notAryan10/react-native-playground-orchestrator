@@ -20,8 +20,15 @@ app.get('/', (req, res) => {
 
 const docker = new Docker();
 
-// Keep track of which user is on which port for the proxy
+// Keep track of user activity
 const userPortMap = new Map<string, string>();
+const lastActivityMap = new Map<string, number>();
+
+const INACTIVITY_LIMIT = 60 * 60 * 1000; // 1 hour
+
+function updateActivity(userId: string) {
+    lastActivityMap.set(userId, Date.now());
+}
 
 let nextPort = PORT_RANGE_START;
 function getNextPort() {
@@ -35,6 +42,7 @@ app.post('/workspaces', async (req, res) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
 
+    updateActivity(userId);
     const containerName = `workspace-con-${userId}`;
     const volumeName = `workspace-vol-${userId}`;
 
@@ -95,6 +103,7 @@ app.post('/workspaces', async (req, res) => {
 // The "Magic Proxy": Forwards traffic from /proxy/userId to localhost:assignedPort
 app.use('/proxy/:userId', (req, res, next) => {
     const { userId } = req.params;
+    if (userId) updateActivity(userId);
     const targetPort = userPortMap.get(userId || '');
 
     if (!targetPort) {
@@ -118,15 +127,40 @@ const server = app.listen(Number(PORT), '0.0.0.0', () => {
     
     // Cleanup interval
     setInterval(async () => {
+        const now = Date.now();
+        console.log(`[Cleanup] Running scheduled cleanup check...`);
+        
         try {
-            const containers = await docker.listContainers({ all: true, filters: { status: ['exited'] } });
-            for (const c of containers) {
+            // 1. Remove containers that have exited naturally
+            const exitedContainers = await docker.listContainers({ all: true, filters: { status: ['exited'] } });
+            for (const c of exitedContainers) {
                 if (c.Names[0]?.includes('workspace-con-')) {
-                    await docker.getContainer(c.Id).remove();
-                    console.log(`Cleaned up: ${c.Names[0]}`);
+                    await docker.getContainer(c.Id).remove().catch(() => {});
+                    console.log(`[Cleanup] Removed exited container: ${c.Names[0]}`);
                 }
             }
-        } catch (e) {}
+
+            // 2. Forcefully remove containers that have been inactive for too long
+            const allContainers = await docker.listContainers({ all: true });
+            for (const c of allContainers) {
+                const name = c.Names[0];
+                if (name?.includes('workspace-con-')) {
+                    const userId = name.replace('/workspace-con-', '').replace('/', '');
+                    const lastSeen = lastActivityMap.get(userId) || 0;
+                    
+                    if (now - lastSeen > INACTIVITY_LIMIT) {
+                        console.log(`[Cleanup] User ${userId} inactive for > 1hr. Forcefully removing container.`);
+                        const container = docker.getContainer(c.Id);
+                        await container.stop().catch(() => {});
+                        await container.remove().catch(() => {});
+                        lastActivityMap.delete(userId);
+                        userPortMap.delete(userId);
+                    }
+                }
+            }
+        } catch (e: any) {
+            console.error('[Cleanup] Error during cleanup:', e.message);
+        }
     }, 5 * 60 * 1000);
 });
 
@@ -151,6 +185,7 @@ server.on('upgrade', (req, socket, head) => {
 
     if (match && match[1]) {
         const userId = match[1];
+        updateActivity(userId);
         const targetPort = userPortMap.get(userId);
 
         if (targetPort) {
