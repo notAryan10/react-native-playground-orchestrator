@@ -65,13 +65,21 @@ app.post('/workspaces', async (req, res) => {
         // Store for proxy
         userPortMap.set(userId, hostPort);
 
-        // In production (Cloudflare), we connect to the secure tunnel URL
-        // We use the proxy path so everything goes through port 443/4000
-        const scheme = PUBLIC_IP.includes('localhost') ? 'ws' : 'wss';
+        // Dynamically determine the host and scheme
+        // 1. Priority: PUBLIC_IP env var (if you want to force a specific domain)
+        // 2. Fallback: req.headers.host (automatically handles IP/Port from the browser's perspective)
+        const host = PUBLIC_IP !== 'localhost' ? PUBLIC_IP : (req.headers.host || 'localhost');
+        
+        // Protocol logic:
+        // - From Vercel/HTTPS, we MUST use wss://
+        // - For local development, we use ws://
+        // If the request is HTTPS, or if we are not on localhost, default to wss
+        const isLocal = host.includes('localhost') || host.includes('127.0.0.1');
+        const scheme = (req.protocol === 'https' || !isLocal) ? 'wss' : 'ws';
         
         res.json({
             status: 'ready',
-            url: `${scheme}://${PUBLIC_IP}/proxy/${userId}`
+            url: `${scheme}://${host}/proxy/${userId}`
         });
 
     } catch (err: any) {
