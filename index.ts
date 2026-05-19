@@ -5,8 +5,8 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const BACKEND_IMAGE = process.env.BACKEND_IMAGE || 'notaryan/rn-playground-backend:latest';
-const PUBLIC_IP = process.env.PUBLIC_IP || 'localhost';
+const BACKEND_IMAGE = process.env.BACKEND_IMAGE || '';
+const PUBLIC_IP = process.env.PUBLIC_IP || '';
 
 const PORT_RANGE_START = 50000;
 const PORT_RANGE_END = 50100;
@@ -111,7 +111,7 @@ app.use('/proxy/:userId', (req, res, next) => {
     }
 
     return createProxyMiddleware({
-        target: `http://localhost:${targetPort}`,
+        target: `${process.env.PROXY_PROTOCOL}://${process.env.PROXY_HOST}:${targetPort}`,
         changeOrigin: true,
         pathRewrite: {
             [`^/proxy/${userId}`]: '',
