@@ -7,6 +7,8 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const BACKEND_IMAGE = process.env.BACKEND_IMAGE || '';
 const PUBLIC_IP = process.env.PUBLIC_IP || '';
+const PROXY_PROTOCOL = process.env.PROXY_PROTOCOL || 'http';
+const PROXY_HOST = process.env.PROXY_HOST || 'localhost';
 
 const PORT_RANGE_START = 50000;
 const PORT_RANGE_END = 50100;
@@ -64,7 +66,10 @@ app.post('/workspaces', async (req, res) => {
                     PortBindings: { '3000/tcp': [{ HostPort: assignedPort.toString() }] },
                     Binds: [`${volumeName}:/workspace`],
                 },
-                Env: [`WORKSPACE_DIR=/workspace`]
+                Env: [
+                    `WORKSPACE_DIR=/workspace`,
+                    `DATABASE_URL=${process.env.DATABASE_URL || ''}`
+                ]
             });
             await container.start();
             await new Promise(r => setTimeout(r, 2000));
@@ -111,7 +116,7 @@ app.use('/proxy/:userId', (req, res, next) => {
     }
 
     return createProxyMiddleware({
-        target: `${process.env.PROXY_PROTOCOL}://${process.env.PROXY_HOST}:${targetPort}`,
+        target: `${PROXY_PROTOCOL}://${PROXY_HOST}:${targetPort}`,
         changeOrigin: true,
         pathRewrite: {
             [`^/proxy/${userId}`]: '',
@@ -191,7 +196,7 @@ server.on('upgrade', (req, socket, head) => {
         if (targetPort) {
             console.log(`[Upgrade] Success: Routing ${userId} to localhost:${targetPort}`);
             const proxy = createProxyMiddleware({
-                target: `http://localhost:${targetPort}`,
+                target: `${PROXY_PROTOCOL}://${PROXY_HOST}:${targetPort}`,
                 changeOrigin: true,
                 ws: true,
                 pathRewrite: {
