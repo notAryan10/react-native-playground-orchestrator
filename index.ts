@@ -66,13 +66,14 @@ app.post('/workspaces', async (req, res) => {
             container = await docker.createContainer({
                 Image: BACKEND_IMAGE,
                 name: containerName,
-                Cmd: ['/usr/local/bin/node', 'dist/server.js'],
+                Cmd: ['node', 'dist/server.js'],
                 WorkingDir: '/app',
                 HostConfig: {
                     PortBindings: { '3000/tcp': [{ HostPort: assignedPort.toString() }] },
                     Binds: [`${volumeName}:/workspace`],
                 },
                 Env: [
+                    `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
                     `WORKSPACE_DIR=/workspace`,
                     `DATABASE_URL=${process.env.DATABASE_URL || ''}`
                 ]
