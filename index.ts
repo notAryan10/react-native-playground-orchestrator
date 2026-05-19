@@ -66,9 +66,6 @@ app.post('/workspaces', async (req, res) => {
             container = await docker.createContainer({
                 Image: BACKEND_IMAGE,
                 name: containerName,
-                // We'll leave Cmd empty to use the one defined in the Dockerfile
-                // but we keep the WorkingDir for safety
-                WorkingDir: '/app',
                 HostConfig: {
                     PortBindings: { '3000/tcp': [{ HostPort: assignedPort.toString() }] },
                     Binds: [`${volumeName}:/workspace`],
