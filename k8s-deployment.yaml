@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rn-orchestrator
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rn-orchestrator
+  template:
+    metadata:
+      labels:
+        app: rn-orchestrator
+    spec:
+      hostNetwork: true # Required to reach Docker containers on localhost
+      containers:
+      - name: orchestrator
+        image: notaryan/rn-playground-orchestrator:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4000
+        env:
+        - name: PORT
+          value: "4000"
+        - name: PUBLIC_IP
+          value: "jump-coins-promoting-cia.trycloudflare.com"
+        - name: PROXY_PROTOCOL
+          value: "http"
+        - name: PROXY_HOST
+          value: "localhost"
+        - name: BACKEND_IMAGE
+          value: "notaryan/rn-playground-backend:latest"
+        - name: DATABASE_URL
+          value: "mongodb+srv://aryanverma100806:18572891@cluster0.vjzbh4r.mongodb.net/native?retryWrites=true&w=majority&appName=Cluster0"
+        volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+      volumes:
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rn-orchestrator-service
+spec:
+  selector:
+    app: rn-orchestrator
+  ports:
+    - protocol: TCP
+      port: 4000
+      targetPort: 4000
+  type: ClusterIP # Use Ingress or Cloudflare Tunnel to expose this
