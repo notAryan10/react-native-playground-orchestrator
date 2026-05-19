@@ -62,6 +62,7 @@ app.post('/workspaces', async (req, res) => {
             container = await docker.createContainer({
                 Image: BACKEND_IMAGE,
                 name: containerName,
+                Cmd: ['node', 'dist/server.js'],
                 HostConfig: {
                     PortBindings: { '3000/tcp': [{ HostPort: assignedPort.toString() }] },
                     Binds: [`${volumeName}:/workspace`],
