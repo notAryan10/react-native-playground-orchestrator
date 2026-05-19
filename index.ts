@@ -58,11 +58,15 @@ app.post('/workspaces', async (req, res) => {
             if (!info.State.Running) await container.start();
         } catch (e) {
             console.log(`Creating new container ${containerName}`);
+            
+            // Force remove if it already exists to avoid 409 Conflict
+            await docker.getContainer(containerName).remove({ force: true }).catch(() => {});
+
             const assignedPort = getNextPort();
             container = await docker.createContainer({
                 Image: BACKEND_IMAGE,
                 name: containerName,
-                Cmd: ['sh', '-c', 'node dist/server.js'],
+                Cmd: ['sh', '-c', '/usr/local/bin/node dist/server.js'],
                 WorkingDir: '/app',
                 HostConfig: {
                     PortBindings: { '3000/tcp': [{ HostPort: assignedPort.toString() }] },
