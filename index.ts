@@ -45,6 +45,19 @@ app.post('/workspaces', async (req, res) => {
     if (!userId) return res.status(400).json({ error: 'userId is required' });
 
     updateActivity(userId);
+
+    if (process.env.LOCAL_DEV === 'true') {
+        console.log(`[LocalDev] Routing ${userId} directly to host port 3000`);
+        userPortMap.set(userId, '3000');
+        const host = req.headers.host || 'localhost';
+        const isLocal = host.includes('localhost') || host.includes('127.0.0.1');
+        const scheme = (req.protocol === 'https' || !isLocal) ? 'wss' : 'ws';
+        return res.json({
+            status: 'ready',
+            url: `${scheme}://${host}/proxy/${userId}`
+        });
+    }
+
     const containerName = `workspace-con-${userId}`;
     const volumeName = `workspace-vol-${userId}`;
 
