@@ -165,7 +165,7 @@ if (ANDROID_ALLOWED) {
         const { userId } = req.body || {};
         if (!userId) return res.status(400).json({ error: 'userId is required' });
         try {
-            const info = await startRuntime(`rt_${userId}`);
+            const info = startRuntime(`rt_${userId}`);
             res.json({
                 runtimeId: info.runtimeId,
                 status: info.status,

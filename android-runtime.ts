@@ -1,5 +1,5 @@
 import { spawn, spawnSync, ChildProcess } from 'child_process';
-import { existsSync, writeFileSync, unlinkSync, readFileSync, openSync, closeSync, readSync } from 'fs';
+import { existsSync, writeFileSync, unlinkSync, readFileSync, openSync, closeSync, readSync, fstatSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import net from 'net';
@@ -121,7 +121,7 @@ async function waitBooted(serial: string, proc: ChildProcess, timeoutMs = BOOT_T
         if (proc.exitCode !== null || proc.signalCode !== null) {
             throw new Error(
                 `emulator for ${serial} exited immediately (code ${proc.exitCode}, signal ${proc.signalCode}). ` +
-                `Common cause: AVD already in use by another emulator, or bad AVD name. stderr: ${procSpawnError(proc)}`,
+                `Common cause: AVD already in use by another emulator, or bad AVD name. log tail: ${tailFile(emuLogPath(serial), 1024) || 'empty'}`,
             );
         }
         const r = await sh(ADB, ['-s', serial, 'shell', 'getprop', 'sys.boot_completed'], 10_000);
@@ -131,35 +131,22 @@ async function waitBooted(serial: string, proc: ChildProcess, timeoutMs = BOOT_T
     throw new Error(`Emulator ${serial} did not finish booting within ${timeoutMs}ms`);
 }
 
-/** Tail of a small log file, '' if unreadable. */
+function emuLogPath(serial: string): string {
+    return `${os.tmpdir()}/rnp-emu-${serial}.log`;
+}
+
+/** Last maxBytes of a log file, '' if unreadable. */
 function tailFile(p: string, maxBytes: number): string {
     try {
         const fd = openSync(p, 'r');
-        const size = Math.min(maxBytes, 8192);
-        const buf = Buffer.alloc(size);
-        const bytes = readSync(fd, buf, 0, size, Math.max(0, 8192 - size));
-        closeSync(fd);
-        return buf.subarray(0, bytes).toString('utf8').trim();
-    } catch { return ''; }
-}
-
-function procSpawnError(proc: ChildProcess): string {
-    const pid = proc.pid;
-    if (!pid) return 'no pid (spawn failed)';
-    // Best-effort tail of the child's log file (stdio goes to files so
-    // adopted orphans cannot die on SIGPIPE - see startRuntimeInner).
-    for (const p of [`${os.tmpdir()}/rnp-emu-${(proc as ChildProcess & { spawnargs?: string[] }).spawnargs?.[2]}.log`]) {
         try {
-            const fd = openSync(p, 'r');
-            const size = Math.min(2048, 4096);
-            const buf = Buffer.alloc(size);
-            const bytes = readSync(fd, buf, 0, size, Math.max(0, 4096 - size));
-            closeSync(fd);
-            const tail = buf.subarray(0, bytes).toString('utf8').trim();
-            if (tail) return `${p}: ${tail.slice(-1024)}`;
-        } catch { /* log may not exist yet */ }
-    }
-    return 'no stderr captured (see /tmp/rnp-emu-*.log)';
+            const size = fstatSync(fd).size;
+            const len = Math.min(maxBytes, size);
+            const buf = Buffer.alloc(len);
+            const bytes = readSync(fd, buf, 0, len, size - len);
+            return buf.subarray(0, bytes).toString('utf8').trim();
+        } finally { closeSync(fd); }
+    } catch { return ''; }
 }
 
 async function startScrcpy(rt: RuntimeInternals): Promise<void> {
@@ -234,62 +221,69 @@ function findAvdBusy(avdName: string, excludeRuntimeId: string): string | undefi
     return undefined;
 }
 
-export async function startRuntime(runtimeId: string, avdName = AVD_NAME): Promise<RuntimeInfo> {
-    const fresh = !runtimes.has(runtimeId);
+/**
+ * Boot failures, kept after the failed runtime is torn down so a polling
+ * client (GET /android/runtime/:id) can see why instead of a bare 404.
+ */
+const lastErrors = new Map<string, { avdName: string; error: string }>();
+
+/**
+ * Returns at once with status 'starting'; the boot (up to BOOT_TIMEOUT_MS)
+ * runs in the background and clients poll getRuntime. A request held open
+ * for the whole boot would outlive proxy timeouts (Cloudflare cuts at 100s).
+ */
+export function startRuntime(runtimeId: string, avdName = AVD_NAME): RuntimeInfo {
     const exists = runtimes.get(runtimeId);
     if (exists && (exists.status === 'ready' || exists.status === 'starting')) {
-        return exists;
+        return getRuntime(runtimeId) as RuntimeInfo;
     }
     const busy = findAvdBusy(avdName, runtimeId);
     if (busy) throw new AvdBusyError(avdName, busy);
+    lastErrors.delete(runtimeId);
 
-    if (fresh) {
-        // TODO: proper try/catch infrastructure when the orchestrator grows
-        const rt: RuntimeInternals = {
+    let rt = exists;
+    if (rt) {
+        // Retry after the emulator died: its ws-scrcpy is still running.
+        rt.scrcpyProc?.kill('SIGTERM');
+        if (rt.wsScrcpyPort) unlinkSyncSafe(scrcpyConfigPath(rt.wsScrcpyPort));
+        rt.emulatorProc = undefined;
+        rt.scrcpyProc = undefined;
+        rt.wsScrcpyPort = undefined;
+        rt.streamUrl = undefined;
+        rt.status = 'starting';
+        rt.error = undefined;
+    } else {
+        rt = {
             runtimeId,
             status: 'starting',
             avdName,
-            adbSerial: await findFreeAdbSerial(),
+            adbSerial: '', // picked in startRuntimeInner
             startedAt: Date.now(),
             inputQueue: Promise.resolve(),
             controlSockets: new Set(),
         };
         runtimes.set(runtimeId, rt);
-    } else if (exists) {
-        exists.status = 'starting';
-        exists.error = undefined;
     }
+    void boot(rt);
+    return getRuntime(runtimeId) as RuntimeInfo;
+}
 
-    const rt = runtimes.get(runtimeId) as RuntimeInternals;
-
+async function boot(rt: RuntimeInternals): Promise<void> {
     try {
-        await persistSession(rt);
+        persistSession(rt);
         await startRuntimeInner(rt);
-        await persistSession(rt);
-        return getRuntime(rt.runtimeId) as RuntimeInfo;
+        persistSession(rt);
     } catch (e: any) {
-        rt.status = 'error';
-        rt.error = String(e?.message || e);
+        if (rt.status === 'stopping') return; // stopped mid-boot, not a failure
+        const error = String(e?.message || e);
+        console.error(`[AndroidRuntime] ${rt.runtimeId} boot failed:`, error);
         await stopRuntime(rt.runtimeId).catch(() => {});
-        throw e;
+        lastErrors.set(rt.runtimeId, { avdName: rt.avdName, error });
     }
 }
 
-/**
- * The bulk of the boot process, in its own function so the session-clean call
- * above can retry (e.g. the AVD becomes free mid-boot).
- */
 async function startRuntimeInner(rt: RuntimeInternals): Promise<void> {
     if (!existsSync(EMULATOR)) throw new Error(`emulator binary not found at ${EMULATOR} (set ANDROID_EMULATOR_BIN)`);
-    const rtAny = rt as RuntimeInternals & { _retryingBoot?: boolean };
-    if (rtAny._retryingBoot) {
-        // rs.startScrcpy would reuse a stale snapshot's port; treat this as a
-        // fresh start instead.
-        rt.emulatorProc = undefined;
-        rt.scrcpyProc = undefined;
-        rt.wsScrcpyPort = undefined;
-        rt.streamUrl = undefined;
-    }
 
     const serial = rt.adbSerial || await findFreeAdbSerial();
     rt.adbSerial = serial;
@@ -304,8 +298,8 @@ async function startRuntimeInner(rt: RuntimeInternals): Promise<void> {
     // depends on them surviving), and a pipe whose read end died means the
     // child's next log write raises SIGPIPE and kills it. A file fd keeps
     // working; tail it for diagnostics (see procSpawnError).
-    const emuLogPath = `${os.tmpdir()}/rnp-emu-${serial}.log`;
-    const emuFd = openSync(emuLogPath, 'a');
+    const logPath = emuLogPath(serial);
+    const emuFd = openSync(logPath, 'a');
     // Audio off in server contexts; keep snapshots ON (default) so resume
     // is fast on restart. Prod images may add -no-snapshot.
     rt.emulatorProc = spawn(EMULATOR, emulatorArgs, { stdio: ['ignore', emuFd, emuFd] });
@@ -314,14 +308,19 @@ async function startRuntimeInner(rt: RuntimeInternals): Promise<void> {
     rt.emulatorProc.on('exit', (code) => {
         if (rt.status === 'stopping') return;
         rt.status = 'error';
-        rt.error = `emulator exited unexpectedly (code ${code}); log: ${emuLogPath}`;
-        void persistSession(rt);
+        rt.error = `emulator exited unexpectedly (code ${code}); log: ${logPath}`;
+        persistSession(rt);
     });
 
     await waitBooted(serial, rt.emulatorProc);
     rt.display = await queryDisplaySize(serial);
     await ensureScrcpyServer(serial);
     await startScrcpy(rt);
+    // Stop landed mid-boot: stopRuntime already ran, so this ws-scrcpy is ours to kill.
+    if (rt.status === 'stopping') {
+        rt.scrcpyProc?.kill('SIGTERM');
+        throw new Error('stopped during boot');
+    }
 
     rt.status = 'ready';
     rt.streamUrl = `http://localhost:${rt.wsScrcpyPort}/#!action=stream&udid=${rt.adbSerial}` +
@@ -382,19 +381,13 @@ function readPersisted(): void {
  *  kill that lands right after a status transition (a debounced "live"
  *  record that never reached disk turns restart adoption into a downgrade
  *  and strands the user). */
-function scheduleFlush(): void {
+function flushSessions(): void {
     try {
         writeFileSync(RUNTIME_STATE_FILE, JSON.stringify({ sessions: [...SESSIONS.values()] }, null, 2));
     } catch (e) {
         console.error('[AndroidRuntime] state file write failed:', String(e));
     }
 }
-
-// Persist immediately (no debounce). The file is tiny and saves are rare
-// (status transitions), so debouncing buys nothing here and costs everything
-// if the process is killed inside the debounce window (orchestrator restart,
-// crash): a "live" record that never reached disk turns restart adoption
-// into a downgrade, stranding the user. Durability over latency.
 
 function persistSession(rt: RuntimeInternals, forcedKind?: SessionKind): void {
     const kind: SessionKind = forcedKind ?? (rt.emulatorProc ? 'live' : 'exited');
@@ -411,7 +404,7 @@ function persistSession(rt: RuntimeInternals, forcedKind?: SessionKind): void {
         savedAt: Date.now(),
     };
     SESSIONS.set(rec.runtimeId, rec);
-    scheduleFlush();
+    flushSessions();
 }
 
 /** Process liveness via signal-0 (same user; re-parented orphans count). */
@@ -458,6 +451,7 @@ function listEmulatorProcesses(): { pid: number; args: string[] }[] {
  * BEFORE listen() so no request can hit a half-initialized registry.
  */
 export function initAndroidRuntime(): void {
+    startIdleBell();
     readPersisted();
     if (!SESSIONS.size) return;
     const procs = listEmulatorProcesses();
@@ -498,8 +492,7 @@ export function initAndroidRuntime(): void {
         console.log(`[AndroidRuntime] adopted ${ses.runtimeId} (user ${ses.runtimeId.slice(3)}): emulator pid ${ses.emuPid} on ${ses.serial}, ws-scrcpy pid ${ses.scrcPid} on :${ses.scrcPort}`);
         verifyAdopted(rt, ses);
     }
-    scheduleFlush();
-    startIdleBell();
+    flushSessions();
 }
 
 /**
@@ -515,7 +508,7 @@ async function verifyAdopted(rt: RuntimeInternals, ses: PersistedSession): Promi
     rt.error = 'adopted ws-scrcpy port stopped answering after restart';
     runtimes.delete(rt.runtimeId);
     SESSIONS.set(rt.runtimeId, { ...ses, kind: 'exited', scrcPid: undefined, scrcPort: undefined, savedAt: Date.now() });
-    scheduleFlush();
+    flushSessions();
     console.log(`[AndroidRuntime] adopted ${rt.runtimeId}: stream port ${ses.scrcPort} dead -> session exited (emulator untouched)`);
 }
 
@@ -569,7 +562,7 @@ export async function stopRuntime(runtimeId: string): Promise<RuntimeInfo> {
         const ses = SESSIONS.get(runtimeId);
         if (ses && ses.kind === 'live') {
             SESSIONS.set(runtimeId, { ...ses, kind: 'exited', emuPid: undefined, emuArgs: undefined, scrcPid: undefined, scrcPort: undefined, savedAt: Date.now() });
-            scheduleFlush();
+            flushSessions();
         }
         throw new Error(`Unknown runtime ${runtimeId}`);
     }
@@ -580,14 +573,24 @@ export async function stopRuntime(runtimeId: string): Promise<RuntimeInfo> {
     rt.controlSockets.clear();
     rt.idleSince = undefined;
     if (rt.wsScrcpyPort) unlinkSyncSafe(scrcpyConfigPath(rt.wsScrcpyPort));
-    rt.scrcpyProc?.kill('SIGTERM');
-    // Clean the guest before the quick-boot snapshot is written, or the stale
-    // scrcpy server comes back on next boot holding tcp:8886.
-    await sh(ADB, ['-s', rt.adbSerial, 'shell', 'pkill', '-f', 'scrcpy'], 5_000);
-    // Graceful first (emu kill writes the quick-boot snapshot so the NEXT
-    // start resumes into this Android state), then hard kill as fallback.
-    const emuKill = await sh(ADB, ['-s', rt.adbSerial, 'emu', 'kill'], 10_000);
-    if (emuKill.code !== 0) rt.emulatorProc?.kill('SIGTERM');
+    // Adopted runtimes have no ChildProcess handles; their pids live in the session record.
+    const ses = SESSIONS.get(runtimeId);
+    if (rt.scrcpyProc) rt.scrcpyProc.kill('SIGTERM');
+    else if (ses?.scrcPid && pidAlive(ses.scrcPid)) process.kill(ses.scrcPid, 'SIGTERM');
+    if (rt.adbSerial) {
+        // Clean the guest before the quick-boot snapshot is written, or the stale
+        // scrcpy server comes back on next boot holding tcp:8886.
+        await sh(ADB, ['-s', rt.adbSerial, 'shell', 'pkill', '-f', 'scrcpy'], 5_000);
+        // Graceful first (emu kill writes the quick-boot snapshot so the NEXT
+        // start resumes into this Android state), then hard kill as fallback.
+        const emuKill = await sh(ADB, ['-s', rt.adbSerial, 'emu', 'kill'], 10_000);
+        if (emuKill.code !== 0) {
+            if (rt.emulatorProc) rt.emulatorProc.kill('SIGTERM');
+            else if (ses?.emuPid && pidAlive(ses.emuPid)) process.kill(ses.emuPid, 'SIGTERM');
+        }
+    } else {
+        rt.emulatorProc?.kill('SIGTERM');
+    }
     runtimes.delete(runtimeId);
     persistSession(rt, 'exited');
     const { emulatorProc: _e, scrcpyProc: _s, bootWaitAbort: _a, inputQueue: _q, controlSockets: _c, emuArgs: _g, idleSince: _i, ...info } = rt;
@@ -600,7 +603,10 @@ function unlinkSyncSafe(p: string): void {
 
 export function getRuntime(runtimeId: string): RuntimeInfo | undefined {
     const rt = runtimes.get(runtimeId);
-    if (!rt) return undefined;
+    if (!rt) {
+        const failed = lastErrors.get(runtimeId);
+        return failed && { runtimeId, status: 'error', avdName: failed.avdName, adbSerial: '', error: failed.error };
+    }
     const { emulatorProc: _e, scrcpyProc: _s, inputQueue: _q, controlSockets: _c, emuArgs: _g, idleSince: _i, ...info } = rt;
     return info;
 }
