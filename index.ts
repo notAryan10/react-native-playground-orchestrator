@@ -3,6 +3,7 @@ import express from 'express';
 import Docker from 'dockerode';
 import cors from 'cors';
 import { createProxyMiddleware } from 'http-proxy-middleware';
+import { randomBytes } from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -40,6 +41,30 @@ function getNextPort() {
     if (nextPort > PORT_RANGE_END) nextPort = PORT_RANGE_START;
     return port;
 }
+
+// Short-lived, single-use pairing tokens for the rnp:// helper flow, so the
+// workspace id never travels through an OS-level URL. In memory: an
+// orchestrator restart voids outstanding tokens (the user just clicks again).
+const PAIR_TOKEN_TTL_MS = 10 * 60 * 1000;
+const pairTokens = new Map<string, { userId: string; expires: number }>();
+
+app.post('/pair', (req, res) => {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    const now = Date.now();
+    for (const [t, p] of pairTokens) if (p.expires < now) pairTokens.delete(t);
+    const token = randomBytes(16).toString('hex');
+    pairTokens.set(token, { userId, expires: now + PAIR_TOKEN_TTL_MS });
+    res.json({ token, expiresInMs: PAIR_TOKEN_TTL_MS });
+});
+
+app.post('/pair/redeem', (req, res) => {
+    const { token } = req.body || {};
+    const p = typeof token === 'string' ? pairTokens.get(token) : undefined;
+    if (p) pairTokens.delete(token);
+    if (!p || p.expires < Date.now()) return res.status(404).json({ error: 'pairing token invalid or expired' });
+    res.json({ id: p.userId });
+});
 
 app.post('/workspaces', async (req, res) => {
     const { userId } = req.body;
