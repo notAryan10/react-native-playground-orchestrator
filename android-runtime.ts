@@ -539,7 +539,9 @@ function startIdleBell(): void {
         const now = Date.now();
         for (const rt of [...runtimes.values()]) {
             if (rt.status === 'stopping' || rt.status === 'stopped') continue;
-            if (rt.controlSockets.size > 0) {
+            // The panel only opens its control socket once the runtime is ready,
+            // so a boot (35-65s on EC2) must not count as idle time.
+            if (rt.controlSockets.size > 0 || rt.status === 'starting') {
                 rt.idleSince = undefined;
                 continue;
             }
