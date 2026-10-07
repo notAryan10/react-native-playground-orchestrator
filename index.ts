@@ -66,6 +66,14 @@ app.post('/pair/redeem', (req, res) => {
     res.json({ id: p.userId });
 });
 
+// The RNP Device helper installs the mobile app from here, so the APK source
+// is server config, never something an rnp:// link can choose.
+app.get('/apk', (_req, res) => {
+    const url = process.env.APK_DOWNLOAD_URL;
+    if (!url) return res.status(404).json({ error: 'APK_DOWNLOAD_URL is not configured' });
+    res.redirect(302, url);
+});
+
 app.post('/workspaces', async (req, res) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
