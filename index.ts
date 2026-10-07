@@ -148,6 +148,94 @@ app.use('/proxy/:userId', (req, res, next) => {
     })(req, res, next);
 });
 
+// ---- Android runtime endpoints (Milestone 3) ----
+// Enabled only when ANDROID_RUNTIME_ALLOWED=true so prod boxes without KVM
+// simply don't expose them. See android-runtime.ts for env config.
+import { WebSocketServer } from 'ws';
+import { startRuntime, stopRuntime, getRuntime, listRuntimes, handleControl, attachControlSocket, detachControlSocket, initAndroidRuntime, AvdBusyError } from './android-runtime.js';
+
+const ANDROID_ALLOWED = process.env.ANDROID_RUNTIME_ALLOWED === 'true';
+
+// Control-plane WebSocket (browser input -> adb). Upgrades are routed manually
+// in server.on('upgrade') below; this server only speaks the message protocol.
+const controlWss = new WebSocketServer({ noServer: true });
+
+if (ANDROID_ALLOWED) {
+    app.post('/android/runtime/start', async (req, res) => {
+        const { userId } = req.body || {};
+        if (!userId) return res.status(400).json({ error: 'userId is required' });
+        try {
+            const info = await startRuntime(`rt_${userId}`);
+            res.json({
+                runtimeId: info.runtimeId,
+                status: info.status,
+                stream: info.status === 'ready'
+                    ? { type: 'ws-scrcpy', url: info.streamUrl }
+                    : undefined,
+            });
+        } catch (e: any) {
+            if (e instanceof AvdBusyError) {
+                res.status(409).json({
+                    error: e.message,
+                    avdName: e.avdName,
+                    busyRuntimeId: e.busyRuntimeId,
+                    hint: 'one runtime per AVD; stop the busy runtime first (POST /android/runtime/:id/stop)',
+                });
+                return;
+            }
+            console.error('[AndroidRuntime] start failed:', e?.message || e);
+            res.status(502).json({ error: 'Android runtime failed to start', detail: String(e?.message || e) });
+        }
+    });
+
+    app.get('/android/runtime/:runtimeId', (req, res) => {
+        const info = getRuntime(req.params.runtimeId);
+        if (!info) return res.status(404).json({ error: 'unknown runtime' });
+        res.json(info);
+    });
+
+    app.post('/android/runtime/:runtimeId/stop', async (req, res) => {
+        try {
+            res.json(await stopRuntime(req.params.runtimeId));
+        } catch (e: any) {
+            res.status(404).json({ error: String(e?.message || e) });
+        }
+    });
+
+    app.get('/android/runtimes', (_req, res) => {
+        res.json({ runtimes: listRuntimes() });
+    });
+
+    // Stream proxy: same ORIGIN path the embedded panel uses for the iframe
+    // and for the ws-scrcpy video WebSocket (via the upgrade handler below).
+    // Both dev and prod go through this route so the panel has exactly one
+    // stream URL shape; ws-scrcpy's index.html uses relative asset paths, so
+    // /bundle.js etc. resolve under the prefix and are proxied too.
+    app.use('/android/stream/:runtimeId', (req, res, next) => {
+        const info = getRuntime(req.params.runtimeId);
+        if (!info || info.status !== 'ready' || !info.wsScrcpyPort) {
+            return res.status(404).send('Android runtime not found or not ready');
+        }
+        return createProxyMiddleware({
+            target: `http://127.0.0.1:${info.wsScrcpyPort}`,
+            changeOrigin: true,
+            pathRewrite: (path: string) => path.replace(/^\/android\/stream\/[^/]+/, ''),
+            on: {
+                error: (err) => console.error(`[AndroidStream] proxy error for ${req.params.runtimeId}:`, err),
+            },
+        })(req, res, next);
+    });
+
+    console.log('[AndroidRuntime] endpoints enabled (ANDROID_RUNTIME_ALLOWED=true)');
+}
+
+// Reconcile persisted sessions with reality (adopt live emulators, downgrade
+// dead records) BEFORE accepting requests, so no route can see a
+// half-initialized registry.
+if (ANDROID_ALLOWED) {
+    initAndroidRuntime();
+}
+
 const server = app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`🚀 Secure Orchestrator ready on port ${PORT}`);
     
@@ -204,6 +292,87 @@ server.on('upgrade', (req, socket, head) => {
     const pathname = rawUrl.split('?')[0];
     if (!pathname) {
         socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        return;
+    }
+
+    // Android runtime control plane: browser touch/keyboard -> adb input.
+    const controlMatch = pathname.match(/^\/android\/runtime\/([^/]+)\/control$/);
+    if (controlMatch) {
+        if (!ANDROID_ALLOWED) {
+            socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+            return;
+        }
+        const runtimeId = controlMatch[1];
+        if (!runtimeId) {
+            socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+            return;
+        }
+        const info = getRuntime(runtimeId);
+        if (!info) {
+            socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+            return;
+        }
+        controlWss.handleUpgrade(req, socket, head, (ws) => {
+            if (!attachControlSocket(runtimeId, ws)) {
+                ws.close(1008, 'unknown runtime');
+                return;
+            }
+            console.log(`[AndroidRuntime] control socket connected for ${runtimeId}`);
+            ws.send(JSON.stringify({ type: 'hello', runtimeId, serial: info.adbSerial, display: info.display }));
+            ws.on('message', (data) => {
+                let msg: unknown;
+                try { msg = JSON.parse(String(data)); } catch {
+                    ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }));
+                    return;
+                }
+                const m = msg as { id?: string; type?: string };
+                if (m?.type === 'ping') {
+                    ws.send(JSON.stringify({ type: 'pong', id: m.id }));
+                    return;
+                }
+                handleControl(runtimeId, msg)
+                    .then((res) => {
+                        if (res.ok) ws.send(JSON.stringify({ type: 'ack', id: m?.id }));
+                        else ws.send(JSON.stringify({ type: 'error', error: res.error, id: m?.id }));
+                    })
+                    .catch((e) => ws.send(JSON.stringify({ type: 'error', error: String(e?.message || e), id: m?.id })));
+            });
+            ws.on('close', () => detachControlSocket(runtimeId, ws));
+            ws.on('error', () => { /* socket failures surface via close */ });
+        });
+        return;
+    }
+
+    // ws-scrcpy video WebSocket for the embedded panel (deep-link `ws` param
+    // points here). Same proxy contract as the HTTP route above.
+    const streamMatch = pathname.match(/^\/android\/stream\/([^/]+)(\/.*)?$/);
+    if (streamMatch && streamMatch[1]) {
+        if (!ANDROID_ALLOWED) {
+            socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+            return;
+        }
+        const streamRuntimeId = streamMatch[1];
+        const streamInfo = getRuntime(streamRuntimeId);
+        if (!streamInfo || streamInfo.status !== 'ready' || !streamInfo.wsScrcpyPort) {
+            socket.end('HTTP/1.1 404 Not Found\r\n\r\n');
+            return;
+        }
+        const streamProxy = createProxyMiddleware({
+            target: `http://127.0.0.1:${streamInfo.wsScrcpyPort}`,
+            changeOrigin: true,
+            ws: true,
+            pathRewrite: (path: string) => path.replace(/^\/android\/stream\/[^/]+/, ''),
+            on: {
+                error: (err) => console.error(`[AndroidStream] upgrade error for ${streamRuntimeId}:`, err),
+            },
+        });
+        // @ts-ignore
+        if (typeof streamProxy.upgrade === 'function') {
+            // @ts-ignore
+            streamProxy.upgrade(req, socket, head);
+        } else {
+            socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        }
         return;
     }
 
